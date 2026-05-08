@@ -18,9 +18,13 @@ package main
 
 import (
 	"context"
+	"log/slog"
+	"os"
+	"strings"
 
 	"github.com/containerd/containerd/v2/pkg/shim"
 
+	"github.com/containerd/nerdbox/internal/diag"
 	"github.com/containerd/nerdbox/internal/logging"
 	"github.com/containerd/nerdbox/pkg/shim/manager"
 
@@ -33,6 +37,20 @@ import (
 
 func init() {
 	logging.SetupShimLog()
+
+	// Skip diag noise for the short-lived "start" / "delete" actions
+	// that share this binary; they don't have a streaming surface and
+	// the shim log isn't even opened for them (see logging.SetupShimLog).
+	for _, a := range os.Args[1:] {
+		if a == "start" || a == "delete" {
+			return
+		}
+	}
+
+	diag.LifecycleEvent("ShimMain.start", "", "",
+		slog.Int("pid", os.Getpid()),
+		slog.String("argv", strings.Join(os.Args, " ")),
+	)
 }
 
 func main() {
@@ -41,4 +59,9 @@ func main() {
 			c.NoSetupLogger = true
 		},
 	)
+	// shim.RunShim returns when the shim's main loop exits. Capture a
+	// final goroutine snapshot so we can spot any leaked goroutines at
+	// process exit time.
+	diag.LifecycleEvent("ShimMain.exit", "", "")
+	diag.DumpGoroutines("shim_main_exit")
 }

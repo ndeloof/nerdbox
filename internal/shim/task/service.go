@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -43,6 +44,7 @@ import (
 	bundleAPI "github.com/containerd/nerdbox/api/services/bundle/v1"
 	mountAPI "github.com/containerd/nerdbox/api/services/mount/v1"
 	"github.com/containerd/nerdbox/api/services/vmevents/v1"
+	"github.com/containerd/nerdbox/internal/diag"
 	"github.com/containerd/nerdbox/internal/nwcfg"
 	"github.com/containerd/nerdbox/internal/shim/sandbox"
 	"github.com/containerd/nerdbox/internal/shim/task/bundle"
@@ -134,6 +136,12 @@ func (s *service) RegisterTTRPC(server *ttrpc.Server) error {
 }
 
 func (s *service) shutdown(ctx context.Context) error {
+	diag.LifecycleEvent("Stop.enter", "", "")
+	defer diag.LifecycleEvent("Stop.exit", "", "")
+	// Capture full goroutine state at the very start of teardown so we
+	// can see what was running while ttrpc still had clients connected.
+	diag.DumpGoroutines("shim_stop_callback")
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var errs []error
@@ -148,19 +156,26 @@ func (s *service) shutdown(ctx context.Context) error {
 		// Unmount all block volumes inside the guest before stopping the VM,
 		// to flush ext4 journals and dirty pages to the virtio-blk devices.
 		// Best-effort with a short retry for transient EBUSY.
+		diag.LifecycleEvent("Unmount.enter", "", "")
 		if vmc, err := s.sb.Client(); err != nil {
+			diag.LifecycleEvent("Unmount.exit", "", "", slog.Any("err", err))
 			log.G(ctx).WithError(err).Warn("failed to get VM client; skipping unmount of block volumes before VM shutdown")
 		} else {
 			unmountCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 			err := unmountAllWithRetry(unmountCtx, mountAPI.NewTTRPCMountClient(vmc))
 			cancel()
+			diag.LifecycleEvent("Unmount.exit", "", "", slog.Any("err", err))
 			if err != nil {
 				log.G(ctx).WithError(err).Warn("failed to unmount all block volumes before VM shutdown")
 			}
 		}
 
+		diag.LifecycleEvent("VMStop.enter", "", "")
 		if err := s.sb.Stop(ctx); err != nil {
+			diag.LifecycleEvent("VMStop.exit", "", "", slog.Any("err", err))
 			errs = append(errs, fmt.Errorf("sandbox shutdown: %w", err))
+		} else {
+			diag.LifecycleEvent("VMStop.exit", "", "")
 		}
 	}
 
@@ -189,6 +204,15 @@ func unmountAllWithRetry(ctx context.Context, mc mountAPI.TTRPCMountService) err
 
 // Create a new initial process and container with the underlying OCI runtime
 func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *taskAPI.CreateTaskResponse, err error) {
+	diag.LifecycleEvent("Create.enter", r.ID, "",
+		slog.String("bundle", r.Bundle),
+		slog.Bool("terminal", r.Terminal),
+	)
+	defer func() {
+		diag.LifecycleEvent("Create.exit", r.ID, "",
+			slog.Any("err", err),
+		)
+	}()
 	log.G(ctx).WithFields(log.Fields{
 		"id":     r.ID,
 		"bundle": r.Bundle,
@@ -318,8 +342,14 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 			if err != nil {
 				if errors.Is(err, io.EOF) || errors.Is(err, shutdown.ErrShutdown) {
 					log.G(ctx).Info("vm event stream closed")
+					diag.LifecycleEvent("VMEventStream.closed", "", "",
+						slog.Any("err", err),
+					)
 				} else {
 					log.G(ctx).WithError(err).Error("vm event stream error")
+					// Unexpected ttrpc termination on the shim<->vminitd
+					// event stream — capture stacks.
+					diag.TTRPCClosed("shim_vmevents", err)
 				}
 				return
 			}
@@ -457,7 +487,11 @@ func (s *service) Create(ctx context.Context, r *taskAPI.CreateTaskRequest) (_ *
 }
 
 // Start a process
-func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.StartResponse, error) {
+func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (resp *taskAPI.StartResponse, err error) {
+	diag.LifecycleEvent("Start.enter", r.ID, r.ExecID)
+	defer func() {
+		diag.LifecycleEvent("Start.exit", r.ID, r.ExecID, slog.Any("err", err))
+	}()
 	log.G(ctx).WithFields(log.Fields{"id": r.ID, "exec": r.ExecID}).Info("starting container task")
 	vmc, err := s.sb.Client()
 	if err != nil {
@@ -468,7 +502,11 @@ func (s *service) Start(ctx context.Context, r *taskAPI.StartRequest) (*taskAPI.
 }
 
 // Delete the initial process and container
-func (s *service) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (*taskAPI.DeleteResponse, error) {
+func (s *service) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (resp *taskAPI.DeleteResponse, err error) {
+	diag.LifecycleEvent("Delete.enter", r.ID, r.ExecID)
+	defer func() {
+		diag.LifecycleEvent("Delete.exit", r.ID, r.ExecID, slog.Any("err", err))
+	}()
 	log.G(ctx).WithFields(log.Fields{"id": r.ID, "exec": r.ExecID}).Info("deleting task")
 	vmc, err := s.sb.Client()
 	if err != nil {
@@ -476,7 +514,7 @@ func (s *service) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (*taskAP
 	}
 
 	tc := taskAPI.NewTTRPCTaskClient(vmc)
-	resp, err := tc.Delete(ctx, r)
+	resp, err = tc.Delete(ctx, r)
 	if err == nil {
 		s.mu.Lock()
 		if c, ok := s.containers[r.ID]; ok {
@@ -501,7 +539,11 @@ func (s *service) Delete(ctx context.Context, r *taskAPI.DeleteRequest) (*taskAP
 }
 
 // Exec an additional process inside the container
-func (s *service) Exec(ctx context.Context, r *taskAPI.ExecProcessRequest) (*ptypes.Empty, error) {
+func (s *service) Exec(ctx context.Context, r *taskAPI.ExecProcessRequest) (_ *ptypes.Empty, err error) {
+	diag.LifecycleEvent("Exec.enter", r.ID, r.ExecID, slog.Bool("terminal", r.Terminal))
+	defer func() {
+		diag.LifecycleEvent("Exec.exit", r.ID, r.ExecID, slog.Any("err", err))
+	}()
 	log.G(ctx).WithFields(log.Fields{"id": r.ID, "exec": r.ExecID}).Info("exec container")
 	vmc, err := s.sb.Client()
 	if err != nil {
@@ -611,7 +653,14 @@ func (s *service) Resume(ctx context.Context, r *taskAPI.ResumeRequest) (*ptypes
 }
 
 // Kill a process with the provided signal
-func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (*ptypes.Empty, error) {
+func (s *service) Kill(ctx context.Context, r *taskAPI.KillRequest) (_ *ptypes.Empty, err error) {
+	diag.LifecycleEvent("Kill.enter", r.ID, r.ExecID,
+		slog.Uint64("signal", uint64(r.Signal)),
+		slog.Bool("all", r.All),
+	)
+	defer func() {
+		diag.LifecycleEvent("Kill.exit", r.ID, r.ExecID, slog.Any("err", err))
+	}()
 	log.G(ctx).WithFields(log.Fields{"id": r.ID, "exec": r.ExecID}).Info("kill")
 	vmc, err := s.sb.Client()
 	if err != nil {
@@ -670,7 +719,11 @@ func (s *service) Update(ctx context.Context, r *taskAPI.UpdateTaskRequest) (*pt
 }
 
 // Wait for a process to exit
-func (s *service) Wait(ctx context.Context, r *taskAPI.WaitRequest) (*taskAPI.WaitResponse, error) {
+func (s *service) Wait(ctx context.Context, r *taskAPI.WaitRequest) (_ *taskAPI.WaitResponse, err error) {
+	diag.LifecycleEvent("Wait.enter", r.ID, r.ExecID)
+	defer func() {
+		diag.LifecycleEvent("Wait.exit", r.ID, r.ExecID, slog.Any("err", err))
+	}()
 	log.G(ctx).WithFields(log.Fields{"id": r.ID, "exec": r.ExecID}).Info("wait")
 	vmc, err := s.sb.Client()
 	if err != nil {
@@ -699,7 +752,14 @@ func (s *service) Connect(ctx context.Context, r *taskAPI.ConnectRequest) (*task
 	}, nil
 }
 
-func (s *service) Shutdown(ctx context.Context, r *taskAPI.ShutdownRequest) (*ptypes.Empty, error) {
+func (s *service) Shutdown(ctx context.Context, r *taskAPI.ShutdownRequest) (_ *ptypes.Empty, err error) {
+	diag.LifecycleEvent("Shutdown.enter", r.ID, "", slog.Bool("now", r.Now))
+	defer func() {
+		diag.LifecycleEvent("Shutdown.exit", r.ID, "", slog.Any("err", err))
+		// Shutdown is the canonical "we are about to stop" signal — dump
+		// goroutines so we can correlate any in-flight ttrpc streams.
+		diag.DumpGoroutines("shim_shutdown:" + r.ID)
+	}()
 	log.G(ctx).WithFields(log.Fields{"id": r.ID}).Info("shutdown")
 
 	// TODO: Should we forward this to VM?

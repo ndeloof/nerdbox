@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -34,6 +35,7 @@ import (
 	"github.com/containerd/log"
 	"github.com/containerd/ttrpc"
 
+	"github.com/containerd/nerdbox/internal/diag"
 	"github.com/containerd/nerdbox/internal/kvm"
 	"github.com/containerd/nerdbox/internal/logging"
 	"github.com/containerd/nerdbox/pkg/vm"
@@ -311,9 +313,14 @@ func (v *vmInstance) Start(ctx context.Context, opts ...vm.StartOpt) (err error)
 	errC := make(chan error)
 	go func() {
 		defer close(errC)
+		diag.LifecycleEvent("VMRun.enter", "", "")
 		if err := v.vmc.Start(); err != nil {
+			diag.LifecycleEvent("VMRun.exit", "", "", slog.Any("err", err))
+			diag.DumpGoroutines("vm_run_error")
 			errC <- err
+			return
 		}
+		diag.LifecycleEvent("VMRun.exit", "", "")
 	}()
 
 	v.shutdownCallbacks = []func(context.Context) error{
@@ -367,7 +374,12 @@ func (v *vmInstance) Start(ctx context.Context, opts ...vm.StartOpt) (err error)
 	}).Info("VM connection established")
 
 	v.shutdownCallbacks = append(v.shutdownCallbacks, func(context.Context) error {
-		return conn.Close()
+		diag.LifecycleEvent("VMRPCConn.close", "", "")
+		err := conn.Close()
+		if err != nil {
+			diag.TTRPCClosed("shim_to_vminitd_rpc", err)
+		}
+		return err
 	})
 
 	v.client = ttrpc.NewClient(conn)
@@ -428,6 +440,8 @@ func (v *vmInstance) Client() *ttrpc.Client {
 }
 
 func (v *vmInstance) Shutdown(ctx context.Context) error {
+	diag.LifecycleEvent("VMShutdown.enter", "", "")
+	defer diag.LifecycleEvent("VMShutdown.exit", "", "")
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.handler == 0 {
@@ -435,6 +449,7 @@ func (v *vmInstance) Shutdown(ctx context.Context) error {
 	}
 	err := dlClose(v.handler)
 	if err != nil {
+		diag.LifecycleEvent("VMShutdown.dlclose_err", "", "", slog.Any("err", err))
 		return err
 	}
 	v.handler = 0 // Mark as closed
